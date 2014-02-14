@@ -156,11 +156,7 @@ put_build_file()
     fi
     md5=$(md5sum "$pathname" | cut -c-32)
 
-    if [ "$ftype" = "zip" ]; then
-        bb-up "$remotedir" "$pathname"
-    else
-        put_file "$REMOTE_UPLOAD_HOST" "$remotedir" "$pathname"
-    fi
+    cp "$pathname" $PWD/../../.
 
     update_md5_file "$device"
     filename=$(basename $pathname)
@@ -190,7 +186,7 @@ update_ota()
     fi
     otaver=${filename%.*}
 
-    pac-push-ota "$otatype" "$device" "$otaver" "$md5" "$dlurl"
+    cp $pathname $PWD/../../.
 }
 
 do_exit()
@@ -353,6 +349,14 @@ for pathname in $CCACHE_ROOT/.ccache-pac_*; do
     fi
     t=$(stat -c "%Y" "$pathname/.lastused")
     delta=$((now-t))
+    if [ "$delta" -ge "$MAX_CCACHE_UNUSED" ]; then
+        log_info "delete old ccache $pathname"
+        rm -rf "$pathname"
+    fi
+done
+
+do_exit "$rc"
+))
     if [ "$delta" -ge "$MAX_CCACHE_UNUSED" ]; then
         log_info "delete old ccache $pathname"
         rm -rf "$pathname"
