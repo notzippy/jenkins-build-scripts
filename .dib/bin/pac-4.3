@@ -1,0 +1,362 @@
+#!/bin/bash
+
+# required-tools: lzop, rdiff, ncftp
+# required-files: .ncftp/bookmarks
+
+
+#if [ -z "$OUT_TOP" ]; then
+#   OUT_TOP="$HOME/build"
+#fi
+
+OUT_TOP="$HOME/build"
+BUILD_TOP="$HOME/src/pac-4.3"
+
+REMOTE_UPLOAD_HOST="pacman"
+REMOTE_UPLOAD_ROOT="public_html"
+REMOTE_DOWNLOAD_HOST="pacman.basketbuild.com"
+
+REMOTE_MANIFEST_ROOT="http://$REMOTE_DOWNLOAD_HOST/index.php?dir=main/logs/"
+
+if [ -z "$CCACHE_ROOT" ]; then
+    CCACHE_ROOT="$HOME"
+fi
+
+# Sync no more than once per hour
+MIN_SYNC_TIME=3600
+
+# Keep out tree for no more than one day
+MAX_OUT_TIME=86400
+
+# Keep unused ccache dirs for no more than one week
+MAX_CCACHE_UNUSED=604800
+
+# Deal with timeouts
+export GIT_HTTP_LOW_SPEED_TIME=300
+export GIT_HTTP_LOW_SPEED_LIMIT=1024
+
+mkdir -p "$OUT_TOP"
+mkdir -p "$BUILD_TOP"
+
+# Acquire build lock
+parent=$(ps h -o comm $PPID)
+if [ "$parent" != "flock" ]; then
+    exec flock "$BUILD_TOP/.build_lock" $0 "$@"
+fi
+
+echo "pac-4.3: args=$@" 1>&2
+if [ "$#" -lt 3 ]; then
+    echo "Usage: $0 <target-device> <version> <user> [args...]"
+    exit 1
+fi
+device="$1"
+shift
+version="$1"
+shift
+user="$1"
+shift
+while [ "$#" -ne 0 ]; do
+    eval "$1"
+    shift
+done
+
+cd "$BUILD_TOP"
+
+buildtype="nightly"
+if [ "$user" != "${user%%@*}" ]; then
+    buildtype="user"
+elif [ "${version:0:7}" != "nightly" ]; then
+    buildtype="release"
+fi
+
+outdir="$OUT_TOP/$buildtype"
+mkdir -p "$outdir"
+
+logpath="$outdir/pac_${device}-${version}.log"
+outpath="$outdir/pac_${device}-${version}.zip"
+
+rm -f "$logpath"
+
+log_info()
+{
+    echo "$@" >>"$logpath"
+}
+
+log_warning()
+{
+    echo -e "\033[33m$@\033[0m" >>"$logpath"
+}
+
+log_error()
+{
+    echo -e "\033[31m$@\033[0m" >>"$logpath"
+}
+
+get_elapsed()
+{
+    local t1="$1"
+    local t2="$2"
+    local d="$((t2-t1))"
+
+    local h=$((d/3600))
+    d="$((d-h*3600))"
+    local m="$((d/60))"
+    d="$((d-m*60))"
+    local s="$d"
+
+    printf "%02d:%02d:%02d" $h $m $s
+}
+
+do_repo()
+{
+    local tries=0
+    local rc=1
+
+    while [ "$rc" -ne 0 -a "$tries" -lt 3 ]; do
+        tries="$((tries+1))"
+        repo "$@" </dev/null >>"$logpath" 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            sleep 60
+        fi
+    done
+    return $rc
+}
+
+put_file()
+{
+    local remote_host="$1"
+    local remote_dir="$2"
+    local local_pathname="$3"
+
+    ncftpput -b "$remote_host" "$remote_dir" "$local_pathname"
+}
+
+update_md5_file()
+{
+    local dev="$1"
+
+    log_error "update_md5_file: implement_me"
+}
+
+put_build_file()
+{
+    local ftype="$1"
+    local device="$2"
+    local pathname="$3"
+    local remotedir
+    if [ "$buildtype" = "user" ]; then
+        remotedir="$REMOTE_UPLOAD_ROOT/main/devs/$user/$device"
+    else
+        remotedir="$REMOTE_UPLOAD_ROOT/main/index.php?dir=main/$device/$buildtype"
+    fi
+
+    if [ ! -f "$pathname" ]; then
+        log_error "put_build_file: cannot find $pathname"
+        return
+    fi
+    md5=$(md5sum "$pathname" | cut -c-32)
+
+    if [ "$ftype" = "zip" ]; then
+        bb-up "$remotedir" "$pathname"
+    else
+        put_file "$REMOTE_UPLOAD_HOST" "$remotedir" "$pathname"
+    fi
+
+    update_md5_file "$device"
+    filename=$(basename $pathname)
+    echo "artifact: $ftype=http://pacman.basketbuild.com/download.php?file=main/$remotedir/$filename"
+}
+
+update_ota()
+{
+    local device="$1"
+    local pathname="$2"
+    local filename
+    local md5
+    local dlurl
+    local otatype
+    local otaver
+
+    if [ "$buildtype" = "user" ]; then
+        return
+    fi
+
+    filename=$(basename $pathname)
+    md5=$(md5sum "$pathname" | cut -c-32)
+    dlurl="http://$REMOTE_DOWNLOAD_HOST/download.php?file=main/$device/$buildtype/$filename"
+    otatype="nightly"
+    if [ "$buildtype" = "release" ]; then
+        otatype="stable"
+    fi
+    otaver=${filename%.*}
+
+    pac-push-ota "$otatype" "$device" "$otaver" "$md5" "$dlurl"
+}
+
+do_exit()
+{
+    local rc="$1"
+
+    put_build_file "log" "$device" "$logpath"
+    exit "$rc"
+}
+
+# Init the repo
+if [ ! -d ".repo" ]; then
+    do_repo init -u https://github.com/PAC-man/pacman -b cm-10.2
+    if [ $? -ne 0 ]; then
+        log_error "Failed to init repo"
+        do_exit 1
+    fi
+fi
+
+now=$(date "+%s")
+
+needsync=1
+if [ "$buildtype" != "user" -a -f ".lastsync" ]; then
+    t=$(stat -c "%Y" .lastsync)
+    delta=$((now-t))
+    if [ "$delta" -lt "$MIN_SYNC_TIME" ]; then
+        needsync=0
+    fi
+fi
+
+if [ "$needsync" -ne 0 ]; then
+    # Nuke any local manifests, in case somebody has been playing with
+    # local builds.
+    if [ -d ".repo/local_manifests" ]; then
+        find ".repo/local_manifests" -type f ! -name "device.xml" -print0 | xargs -0 rm -f
+    fi
+
+    log_info "Syncing build tree"
+    # Sync vendor/pac to get the current pac version and nightly list
+    do_repo sync "vendor/pac"
+    if [ $? -ne 0 ]; then
+        log_error "Failed to sync vendor/pac repo"
+        do_exit 1
+    fi
+
+    pac-add-devices >>"$logpath" 2>&1
+    repo forall -c "git reset --hard HEAD; git clean -q -f"
+    do_repo sync
+    if [ $? -ne 0 ]; then
+        log_error "Failed to sync repo"
+        do_exit 1
+    fi
+    touch ".lastsync"
+
+    ## Remove repos that no longer exist
+    #for projdir in $(find .repo/projects -type d -name "*.git"); do
+    #   d=$(echo $projdir | cut -d'/' -f3-)
+    #   if [ ! -d "$d" ]; then
+    #       log_info "Removing unused project dir $projdir"
+    #       rm -rf "$projdir"
+    #   fi
+    #done
+fi
+
+nukeout=1
+if [ -f "out/.stamp" ]; then
+    stamp=$(stat -c "%Y" "out/.stamp")
+    delta=$((now-stamp))
+    if [ "$delta" -lt "$MAX_OUT_TIME" ]; then
+        nukeout=0
+    fi
+fi
+
+if [ "$nukeout" -ne 0 ]; then
+    rm -rf "out"
+    mkdir -p "out"
+    touch "out/.stamp"
+fi
+
+if [ "$buildtype" = "release" -a ! -f "$outdir/manifest-${version}.xml" ]; then
+    wget -q -O "$outdir/manifest-${version}.xml" "$REMOTE_MANIFEST_ROOT/manifest-${version}.xml"
+    if [ $? -ne 0 ]; then
+        log_error "Failed to fetch $REMOTE_MANIFEST_ROOT/manifest-${version}.xml"
+        do_exit 1
+    fi
+    android-tag restore < "$outdir/manifest-${version}.xml" >>"$logpath" 2>&1
+fi
+
+# Fetch prebuilts
+if [ -x "vendor/cm/get-prebuilts" ]; then
+    log_info "Checking CM proprietary prebuilts"
+    n=0
+    if [ -d "vendor/cm/proprietary" ]; then
+        n=$(find "vendor/cm/proprietary" -type f | wc -l)
+    fi
+    log_info "Found $n files in vendor/cm/proprietary"
+    # We should have at least 2 files: a lib and an apk
+    if [ "$n" -lt 2 ]; then
+        log_info "Fetching CM proprietary prebuilts"
+        vendor/cm/get-prebuilts
+    fi
+fi
+
+# XXX: work around make internal errors?
+
+# XXX: build overwrites android-logo-mask.png
+if [ -f "frameworks/base/core/res/assets/images/android-logo-mask.png" ]; then
+    (cd frameworks/base; git checkout "core/res/assets/images/android-logo-mask.png" >/dev/null 2>&1)
+fi
+
+log_info "build $device: start at $(date +%H:%M:%S)"
+t1=$(date +%s)
+android-build -l -v "$version" -o "$outdir" -p "vendor/pac/tools/squisher" "pac_${device}-userdebug" >>"$logpath" 2>&1
+rc=$?
+t2=$(date +%s)
+elapsed=$(get_elapsed $t1 $t2)
+if [ "$rc" -eq 0 ]; then
+    log_info "build $device: end at $(date +%H:%M:%S): elapsed=$elapsed"
+    if [ "$version" = "test" ];then
+        echo "1" > $HOME/.dib/build_enable
+    fi
+    else
+    log_error "build $device: end at $(date +%H:%M:%S): rc=$rc"
+fi
+
+log_info "resetting source tree"
+repo forall -c "git reset --hard HEAD; git clean -q -f"
+
+mv "out/target/product/$device" "out/target/product/$device.del"
+ionice -c 3 rm -rf "out/target/product/$device.del" &
+
+if [ "$rc" -eq 0 ]; then
+    put_build_file "zip" "$device" "$outpath"
+    update_ota "$device" "$outpath"
+else
+    log_error "build $device: failed"
+    tail -n 500 "$logpath" | ascii2html > "$logpath.html"
+    put_build_file "err" "$device" "$logpath.html"
+fi
+
+log_info "cleaning old logs"
+files=$(find "$OUT_TOP" -type f -mtime +14 ! -name "*.zip")
+for p in $files; do
+    f=$(basename $p)
+    log_info "delete old log $f"
+    rm -f "$p"
+done
+log_info "cleaning old roms"
+files=$(find "$OUT_TOP" -type f -mtime +2 -name "*.zip")
+for p in $files; do
+    f=$(basename $p)
+    log_info "delete old rom $f"
+    rm -f "$p"
+done
+log_info "cleaning old ccache"
+for pathname in $CCACHE_ROOT/.ccache-pac_*; do
+    if [ ! -f "$pathname/.lastused" ]; then
+        touch "$pathname/.lastused"
+        continue
+    fi
+    t=$(stat -c "%Y" "$pathname/.lastused")
+    delta=$((now-t))
+    if [ "$delta" -ge "$MAX_CCACHE_UNUSED" ]; then
+        log_info "delete old ccache $pathname"
+        rm -rf "$pathname"
+    fi
+done
+
+do_exit "$rc"
